@@ -1,0 +1,254 @@
+-- Deterministic seed for the Riverbend Community Radio LibreTime install.
+--
+-- Theme: a small volunteer-run community station with a 27-track music and
+-- station-audio library, four playlists, one smart block plus one static block,
+-- three weekly shows and two webstreams.
+--
+-- The file is re-runnable: every seeded table is cleared first, ids are fixed,
+-- and the id sequences are advanced past the seeded rows so records created in
+-- the UI afterwards never collide.
+--
+-- Media: cc_files.filepath is relative to storage.path (/srv/libretime).
+-- Each seeded track file is N concatenated copies of the pinned upstream
+-- fixture api/libretime_api/_fixtures/song.mp3 (40.81 s, 128 kbps, 44.1 kHz),
+-- and filesize = N * 654105. N is derived in ./tester-env from that column.
+-- Declared lengths are N * 40.81 s rounded to the second.
+
+BEGIN;
+
+DELETE FROM cc_schedule;
+DELETE FROM cc_show_instances;
+DELETE FROM cc_show_days;
+DELETE FROM cc_show_rebroadcast;
+DELETE FROM cc_show_hosts;
+DELETE FROM cc_show;
+DELETE FROM cc_playlistcontents;
+DELETE FROM cc_playlist;
+DELETE FROM cc_blockcontents;
+DELETE FROM cc_blockcriteria;
+DELETE FROM cc_block;
+DELETE FROM cc_webstream;
+DELETE FROM cc_files;
+DELETE FROM cc_subjs WHERE id <> 1;
+
+-- Station is set up already: suppress the first-login language/timezone popup.
+INSERT INTO cc_pref (keystr, valstr) VALUES ('lang_tz_setup_complete', '1')
+    ON CONFLICT (keystr) WHERE subjid IS NULL DO UPDATE SET valstr = EXCLUDED.valstr;
+
+-- Users: admin/admin from migrations/sql/data.sql, plus two staff accounts.
+-- type A = admin, P = program manager, H = DJ/host.
+INSERT INTO cc_subjs (id, login, pass, type, first_name, last_name, email) VALUES
+    (2, 'dana',  md5('dana'),  'P', 'Dana', 'Whitfield', 'dana@riverbendradio.example'),
+    (3, 'miles', md5('miles'), 'H', 'Miles', 'Okafor',   'miles@riverbendradio.example');
+
+-- Library. import_status 0 = success (see CcFiles::IMPORT_STATUS_SUCCESS).
+INSERT INTO cc_files
+    (id, name, mime, ftype, filepath, import_status, mtime, utime, track_title,
+     artist_name, bit_rate, sample_rate, format, length, album_title, genre, year,
+     track_number, channels, bpm, file_exists, hidden, is_scheduled, filesize,
+     owner_id, cuein, cueout)
+SELECT id, name, 'audio/mpeg', 'audioclip', 'seed/' || name, 0,
+       utime + interval '5 minutes', utime, track_title, artist_name,
+       128000, 44100, 'MP3', length::interval, album_title, genre, year,
+       track_number, 2, bpm, true, false, false, copies * 654105,
+       owner_id, interval '00:00:00', length::interval
+FROM (VALUES
+    (1,  '01-blue-hour-waltz.mp3',          'Blue Hour Waltz',                        'Delta Standard Trio',     'Night Shift Sessions', 'Jazz',       '2022', 1,   6, '00:04:05', 132::int, 2, '2026-10-02 09:12:00'::timestamp),
+    (2,  '02-corner-table.mp3',             'Corner Table',                           'Delta Standard Trio',     'Night Shift Sessions', 'Jazz',       '2022', 2,   5, '00:03:24', 118,      2, '2026-10-02 09:13:00'),
+    (3,  '03-midnight-ledger.mp3',          'Midnight Ledger',                        'Cora Vance Quartet',      'Ledger Lines',         'Jazz',       '2024', 1,   8, '00:05:26',  96,      1, '2026-09-18 14:05:00'),
+    (4,  '04-rain-on-ninth-street.mp3',     'Rain on Ninth Street',                   'Cora Vance Quartet',      'Ledger Lines',         'Jazz',       '2024', 2,   7, '00:04:46', 104,      1, '2026-09-18 14:06:00'),
+    (5,  '05-green-room-blues.mp3',         'Green Room Blues',                       'Theo Marsh',              'After Hours',          'Jazz',       '2019', 1,   4, '00:02:43',  88,      1, '2025-11-14 11:20:00'),
+    (6,  '06-honeycomb.mp3',                'Honeycomb',                              'The Idle Sons',           'Bright Signals',       'Soul',       '2020', 1,   5, '00:03:24', 100,      3, '2026-08-27 10:00:00'),
+    (7,  '07-halfway-home.mp3',             'Halfway Home',                           'The Idle Sons',           'Bright Signals',       'Soul',       '2020', 2,   6, '00:04:05',  92,      3, '2026-08-27 10:01:00'),
+    (8,  '08-velvet-morning.mp3',           'Velvet Morning',                         'Adaeze Okoro',            'Velvet Morning',       'Soul',       '2025', 1,   5, '00:03:24',  84,      1, '2026-11-05 16:40:00'),
+    (9,  '09-sunday-static.mp3',            'Sunday Static',                          'The Lantern Club',        'Slow Frequency',       'Indie Rock', '2021', 1,   5, '00:03:24', 142,      1, '2026-07-09 08:30:00'),
+    (10, '10-borrowed-weather.mp3',         'Borrowed Weather',                       'The Lantern Club',        'Slow Frequency',       'Indie Rock', '2021', 2,   6, '00:04:05', 138,      1, '2026-07-09 08:31:00'),
+    (11, '11-cardboard-moon.mp3',           'Cardboard Moon',                         'Pale Harbor',              NULL,                  'Indie Rock', '2023', 1,   4, '00:02:43', 156,      1, '2026-10-21 19:15:00'),
+    (12, '12-signal-fire.mp3',              'Signal Fire',                            'Pale Harbor',             'Cardboard Moon',       'Indie Rock', '2023', 2,   7, '00:04:46', 148,      1, '2026-10-21 19:16:00'),
+    (13, '13-northbound.mp3',               'Northbound',                             'Mara Ellison',            'Paper Lanterns',       'Folk',       '2023', 1,   5, '00:03:24',  78,      3, '2026-06-12 12:10:00'),
+    (14, '14-winter-ferry.mp3',             'Winter Ferry',                           'Mara Ellison',            'Paper Lanterns',       'Folk',       '2023', 2,   6, '00:04:05',  72,      3, '2026-06-12 12:11:00'),
+    (15, '15-copper-kettle-road.mp3',       'Copper Kettle Road',                     'Junie Hart',              'Field Notes',          'Folk',       '2018', 1,   4, '00:02:43',  96,      3, '2025-12-03 09:45:00'),
+    (16, '16-long-way-to-wilton.mp3',       'Long Way to Wilton',                     'Junie Hart',              'Field Notes',          'Folk',       '2018', 2,   8, '00:05:26',  88,      3, '2025-12-03 09:46:00'),
+    (17, '17-low-orbit.mp3',                'Low Orbit',                              'Static Bloom',            'Neon Cartography',     'Electronic', '2024', 1,   7, '00:04:46', 122,      2, '2026-09-02 21:30:00'),
+    (18, '18-night-bus.mp3',                'Night Bus',                              'Static Bloom',            'Neon Cartography',     'Electronic', '2024', 2,   5, '00:03:24', 128,      2, '2026-09-02 21:31:00'),
+    (19, '19-glass-arcade.mp3',             'Glass Arcade',                           'Mireille Kwan',           'Glass Arcade',         'Electronic', '2022', 1,   6, '00:04:05', 116,      2, '2026-05-19 15:00:00'),
+    (20, '20-rust-belt-serenade.mp3',       'Rust Belt Serenade',                     'Big Walter Doyle',        'Rust Belt Serenade',   'Blues',      '2017', 1,   7, '00:04:46',  76,      2, '2025-10-07 18:25:00'),
+    (21, '21-train-dont-wait.mp3',          'Train Don''t Wait',                      'Big Walter Doyle',        'Rust Belt Serenade',   'Blues',      '2017', 2,   5, '00:03:24', 108,      2, '2025-10-07 18:26:00'),
+    (22, '22-sunday-morning-rain-live.mp3', 'Sunday Morning Rain (Live at the Harbor)','Bea Coleman',             'Copper Line',          'Blues',      '2021', 3,   6, '00:04:05',  82,      2, '2026-04-23 13:33:00'),
+    (23, '23-tidewater.mp3',                'Tidewater',                              'Aster Fields',            'Tidewater',            'Ambient',    '2023', 1,   8, '00:05:26',  60,      3, '2026-03-15 07:05:00'),
+    (24, '24-harbor-lights.mp3',            'Harbor Lights',                          'Aster Fields',            'Tidewater',            'Ambient',    '2023', 2,   6, '00:04:05',  64,      3, '2026-03-15 07:06:00'),
+    (25, '25-station-id-morning.mp3',       'Riverbend Station ID - Morning',         'Riverbend Station Voices','Station IDs',          'Station ID', '2026', 1,   1, '00:00:41', NULL::int,1, '2026-01-08 10:00:00'),
+    (26, '26-station-id-evening.mp3',       'Riverbend Station ID - Evening',         'Riverbend Station Voices','Station IDs',          'Station ID', '2026', 2,   1, '00:00:41', NULL,     1, '2026-01-08 10:01:00'),
+    (27, '27-underwriting-bed.mp3',         'Underwriting Bed (Short)',               'Riverbend Production',    'Station IDs',          'Bed',        '2026', 3,   1, '00:00:41', NULL,     1, '2026-01-08 10:02:00')
+) AS t (id, name, track_title, artist_name, album_title, genre, year,
+        track_number, copies, length, bpm, owner_id, utime)
+ORDER BY id;
+
+-- Playlists (one per seeded show, plus a short station-audio bed list).
+INSERT INTO cc_playlist (id, name, mtime, utime, creator_id, description, length) VALUES
+    (1, 'Morning Drive',      '2026-11-09 07:20:00', '2026-11-09 07:05:00', 1,
+        'Weekday breakfast rotation: upbeat folk, soul and indie.', interval '00:00:00'),
+    (2, 'Late Night Jazz',    '2026-11-13 22:10:00', '2026-11-13 21:55:00', 2,
+        'After-hours jazz selections for the Friday night show.',  interval '00:00:00'),
+    (3, 'Weekend Folk Hour',  '2026-11-14 18:30:00', '2026-11-14 18:10:00', 3,
+        'Acoustic and folk picks for Saturday evenings.',          interval '00:00:00'),
+    (4, 'Station IDs and Beds','2026-11-08 10:15:00', '2026-11-08 10:00:00', 1,
+        'Short identification and underwriting audio.',            interval '00:00:00');
+
+-- type 0 = file
+INSERT INTO cc_playlistcontents
+    (playlist_id, file_id, type, position, trackoffset, cliplength, cuein, cueout, fadein, fadeout)
+SELECT playlist_id, file_id, 0, position, 0, f.length, interval '00:00:00', f.length,
+       time '00:00:00', time '00:00:00'
+FROM (VALUES
+    (1, 13, 0), (1, 9, 1), (1, 6, 2), (1, 17, 3), (1, 1, 4), (1, 5, 5),
+    (2, 3, 0), (2, 1, 1), (2, 4, 2), (2, 2, 3), (2, 5, 4),
+    (3, 13, 0), (3, 14, 1), (3, 15, 2), (3, 16, 3),
+    (4, 25, 0), (4, 26, 1), (4, 27, 2)
+) AS pc (playlist_id, file_id, position)
+JOIN cc_files f ON f.id = pc.file_id;
+
+UPDATE cc_files SET is_playlist = true
+WHERE id IN (1, 2, 3, 4, 5, 6, 9, 13, 14, 15, 16, 17, 25, 26, 27);
+
+UPDATE cc_playlist p SET length = COALESCE(
+    (SELECT sum(c.cliplength) FROM cc_playlistcontents c WHERE c.playlist_id = p.id),
+    interval '00:00:00');
+
+-- Smart block: dynamic, every jazz track, newest first, capped at 30 minutes.
+INSERT INTO cc_block (id, name, mtime, utime, creator_id, description, length, type) VALUES
+    (1, 'Jazz Rotation', '2026-11-10 12:40:00', '2026-11-10 12:30:00', 2,
+        'Auto-fills from the jazz catalogue, newest first, capped at 30 minutes.', interval '00:30:00', 'dynamic'),
+    (2, 'Top of Hour Beds', '2026-11-08 10:30:00', '2026-11-08 10:20:00', 1,
+        'Static pair of short station beds for the top of the hour.', interval '00:00:00', 'static');
+
+INSERT INTO cc_blockcriteria (criteria, modifier, value, extra, criteriagroup, block_id) VALUES
+    ('genre',          'contains', 'Jazz', NULL, 0, 1),
+    ('sort',           'N/A',      'newest', NULL, NULL, 1),
+    ('limit',          'minutes',  '30',   NULL, NULL, 1),
+    ('repeat_tracks',  'N/A',      '0',    NULL, NULL, 1),
+    ('overflow_tracks','N/A',      '0',    NULL, NULL, 1);
+
+INSERT INTO cc_blockcontents
+    (block_id, file_id, position, trackoffset, cliplength, cuein, cueout, fadein, fadeout)
+SELECT 2, file_id, position, 0, f.length, interval '00:00:00', f.length,
+       time '00:00:00', time '00:00:00'
+FROM (VALUES (27, 0), (25, 1)) AS bc (file_id, position)
+JOIN cc_files f ON f.id = bc.file_id;
+
+UPDATE cc_block b SET length = COALESCE(
+    (SELECT sum(bc.cliplength) FROM cc_blockcontents bc WHERE bc.block_id = b.id),
+    interval '00:00:00')
+WHERE b.type = 'static';
+
+INSERT INTO cc_webstream (id, name, description, url, length, creator_id, mtime, utime, mime) VALUES
+    (1, 'Riverbend Live Studio Feed', 'Live from Studio B during local programming.',
+        'https://stream.riverbendradio.example/live', interval '01:00:00', 1,
+        '2026-11-06 09:10:00', '2026-11-06 09:00:00', 'audio/mpeg'),
+    (2, 'World Service Overnight', 'Overnight relay of the international news service.',
+        'https://stream.riverbendradio.example/world-service', interval '02:00:00', 3,
+        '2026-11-06 09:40:00', '2026-11-06 09:30:00', 'audio/mpeg');
+
+-- Weekly shows, each linked to its autoplaylist.
+INSERT INTO cc_show
+    (id, name, genre, description, color, background_color, linked, is_linkable,
+     has_autoplaylist, autoplaylist_id, autoplaylist_repeat) VALUES
+    (1, 'Sunrise Broadcast', 'Eclectic',
+        'Weekday-morning mix of folk, soul and indie records for the early commute.',
+        '4a90d9', 'cfe3f5', true, true, true, 1, true),
+    (2, 'After Hours Jazz', 'Jazz',
+        'Late Friday jazz programme hosted from the studio.',
+        '7b4fa1', 'e7ddf2', true, true, true, 2, true),
+    (3, 'Saturday Folk Session', 'Folk',
+        'Two hours of acoustic and folk music from the region.',
+        'b07d3b', 'f3e6d2', true, true, true, 3, true);
+
+-- first_show keeps the stable day-of-week anchor; next_pop_date starts the
+-- instance generator at the current week so only current/future instances exist.
+INSERT INTO cc_show_days
+    (first_show, last_show, start_time, timezone, duration, day, repeat_type,
+     next_pop_date, show_id, record)
+VALUES
+    ('2026-01-05', NULL, '06:00:00', 'UTC', '3:00', 1, 0,
+        date_trunc('week', now())::date, 1, 0),
+    ('2026-01-02', NULL, '22:00:00', 'UTC', '1:59', 5, 0,
+        date_trunc('week', now())::date + 4, 2, 0),
+    ('2026-01-03', NULL, '19:00:00', 'UTC', '2:00', 6, 0,
+        date_trunc('week', now())::date + 5, 3, 0);
+
+INSERT INTO cc_show_hosts (show_id, subjs_id) VALUES (1, 3), (2, 2), (3, 3);
+
+-- Show instances for the current and next week, anchored to the Monday of the
+-- week in which the seed runs (the calendar's default week/month view is
+-- wall-clock relative). Instances are inserted explicitly because the legacy
+-- generator commits through a persistent Propel connection that the calendar
+-- leaves inside an open transaction (getShowHasAutoplaylist never commits), so
+-- generated instances are rolled back. Day-of-week, start time, duration and
+-- show name are stable; only the calendar date follows the seed week.
+INSERT INTO cc_show_instances
+    (id, description, starts, ends, show_id, record, rebroadcast, created,
+     last_scheduled, modified_instance, autoplaylist_built)
+SELECT v.id, '', m.monday + v.start_offset, m.monday + v.start_offset + v.duration,
+       v.show_id, 0, 0, '2026-11-01 09:00:00', NULL, false, true
+FROM (VALUES
+    -- current week
+    (1, 1, interval '6 hours',  interval '3 hours'),
+    (2, 2, interval '4 days 22 hours', interval '1 hour 59 minutes'),
+    (3, 3, interval '5 days 19 hours', interval '2 hours'),
+    -- next week
+    (4, 1, interval '7 days 6 hours',  interval '3 hours'),
+    (5, 2, interval '11 days 22 hours', interval '1 hour 59 minutes'),
+    (6, 3, interval '12 days 19 hours', interval '2 hours')
+) AS v (id, show_id, start_offset, duration)
+CROSS JOIN (SELECT date_trunc('week', now())::timestamp AS monday) AS m;
+
+-- Tell the calendar instances are already populated up to three weeks out.
+INSERT INTO cc_pref (keystr, valstr)
+SELECT 'shows_populated_until',
+       to_char(date_trunc('week', now()) + interval '21 days', 'YYYY-MM-DD HH24:MI:SS')
+    ON CONFLICT (keystr) WHERE subjid IS NULL DO UPDATE SET valstr = EXCLUDED.valstr;
+
+-- Show content: one pass over each linked playlists' tracks per instance,
+-- consecutive from the instance start (like the scheduler's fill step, which
+-- would repeat the playlist to fill the whole slot). Keeps the showbuilder and
+-- the show-content dialog populated without the playout daemon.
+INSERT INTO cc_schedule
+    (starts, ends, file_id, clip_length, fade_in, fade_out, cue_in, cue_out,
+     instance_id, position, playout_status, broadcasted)
+SELECT si.starts
+         + COALESCE(sum(pc.cliplength) OVER w_before, interval '0'),
+       si.starts + sum(pc.cliplength) OVER w_through,
+       pc.file_id, pc.cliplength, time '00:00:00', time '00:00:00',
+       pc.cuein, pc.cueout, si.id, pc.position, 1, 0
+FROM cc_show_instances si
+JOIN cc_show s ON s.id = si.show_id AND s.linked = true
+JOIN cc_playlistcontents pc ON pc.playlist_id = s.autoplaylist_id AND pc.type = 0
+WHERE si.id BETWEEN 1 AND 6
+WINDOW w_before AS (PARTITION BY si.id ORDER BY pc.position
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+       w_through AS (PARTITION BY si.id ORDER BY pc.position
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+ORDER BY si.id, pc.position;
+
+UPDATE cc_show_instances si
+SET time_filled = COALESCE(
+        (SELECT sum(sc.clip_length) FROM cc_schedule sc WHERE sc.instance_id = si.id),
+        interval '00:00:00')
+WHERE si.id BETWEEN 1 AND 6;
+
+-- Advance the id sequences past the fixed seed ids so UI-created records do not
+-- collide with seeded rows.
+SELECT setval(pg_get_serial_sequence('cc_files', 'id'),            (SELECT max(id) FROM cc_files));
+SELECT setval(pg_get_serial_sequence('cc_playlist', 'id'),         (SELECT max(id) FROM cc_playlist));
+SELECT setval(pg_get_serial_sequence('cc_playlistcontents', 'id'), (SELECT max(id) FROM cc_playlistcontents));
+SELECT setval(pg_get_serial_sequence('cc_block', 'id'),            (SELECT max(id) FROM cc_block));
+SELECT setval(pg_get_serial_sequence('cc_blockcontents', 'id'),    (SELECT max(id) FROM cc_blockcontents));
+SELECT setval(pg_get_serial_sequence('cc_blockcriteria', 'id'),    (SELECT max(id) FROM cc_blockcriteria));
+SELECT setval(pg_get_serial_sequence('cc_webstream', 'id'),        (SELECT max(id) FROM cc_webstream));
+SELECT setval(pg_get_serial_sequence('cc_show', 'id'),             (SELECT max(id) FROM cc_show));
+SELECT setval(pg_get_serial_sequence('cc_show_days', 'id'),        (SELECT max(id) FROM cc_show_days));
+SELECT setval(pg_get_serial_sequence('cc_show_instances', 'id'),   6);
+SELECT setval(pg_get_serial_sequence('cc_schedule', 'id'),   (SELECT max(id) FROM cc_schedule));
+SELECT setval(pg_get_serial_sequence('cc_subjs', 'id'),            (SELECT max(id) FROM cc_subjs));
+
+COMMIT;

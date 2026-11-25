@@ -1,0 +1,87 @@
+# Reduced UI-only LibreTime stack built from this checkout.
+#
+# Only the services needed for the browser UI: postgres, rabbitmq, api, legacy
+# and nginx. playout/liquidsoap/icecast/analyzer/worker are intentionally
+# omitted; stream, listener and import-status views degrade to offline states,
+# so keep scenario assertions on library/playlist/schedule/settings surfaces.
+#
+# The tester-env CLI (./tester-env) is the supported entry point: it supplies
+# IMAGE_TAG, PORT, APP_URL and LIBRETIME_CONFIG_FILEPATH. RUN_ID scopes the
+# compose project only. Images are tagged `${IMAGE_TAG}-<target>` because the
+# three build targets cannot share one tag.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: libretime
+      POSTGRES_PASSWORD: libretime
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U libretime -d libretime
+
+  rabbitmq:
+    image: rabbitmq:4.4-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_VHOST: /libretime
+      RABBITMQ_DEFAULT_USER: libretime
+      RABBITMQ_DEFAULT_PASS: libretime
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: nc -z 127.0.0.1 5672
+
+  api:
+    build:
+      context: .
+      target: libretime-api
+    image: ${IMAGE_TAG:-tester-env-libretime:dev}-api
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ${LIBRETIME_CONFIG_FILEPATH:-./tester-env.config.yml}:/etc/libretime/config.yml:ro
+      - libretime_storage:/srv/libretime
+
+  legacy:
+    build:
+      context: .
+      target: libretime-legacy
+    image: ${IMAGE_TAG:-tester-env-libretime:dev}-legacy
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ${LIBRETIME_CONFIG_FILEPATH:-./tester-env.config.yml}:/etc/libretime/config.yml:ro
+      - libretime_storage:/srv/libretime
+      # Mutation path: only these two subtrees are bind-mounted. Mounting all of
+      # legacy/ would hide the image's composer vendor tree. JS is served by
+      # nginx, PHP by php-fpm; both mounts are read-only.
+      - ./legacy/public/js:/var/www/html/public/js:ro
+      - ./legacy/application:/var/www/html/application:ro
+
+  nginx:
+    build:
+      context: .
+      target: libretime-nginx
+    image: ${IMAGE_TAG:-tester-env-libretime:dev}-nginx
+    ports:
+      - ${PORT:-18650}:8080
+    depends_on:
+      - legacy
+      - api
+    volumes:
+      - libretime_storage:/srv/libretime:ro
+      - ./legacy/public/js:/var/www/html/public/js:ro
+
+volumes:
+  postgres_data: {}
+  rabbitmq_data: {}
+  libretime_storage: {}

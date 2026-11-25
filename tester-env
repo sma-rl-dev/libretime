@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# tester-env CLI for LibreTime (LibreTime/libretime main @
+# 97290cf3a340e712d70843b235cb9ca03773970e).
+#
+# Reduced UI-only stack built from this editable checkout (see
+# docker-compose.tester-env.yml): postgres:17, rabbitmq, api (gunicorn/ASGI
+# :9001), legacy (php-fpm :9000) and nginx (:8080, published on $PORT).
+# playout/liquidsoap/icecast/analyzer/worker are omitted; keep assertions on
+# library, playlist, schedule, podcast/webstream, settings and users surfaces.
+#
+# Deterministic credentials: admin / admin, inserted by
+# `libretime-api migrate` (api/libretime_api/legacy/migrations/sql/data.sql).
+#
+# Mutation path: legacy/public/js (served by nginx) and legacy/application
+# (php-fpm) are bind-mounted read-only, so UI edits need no rebuild. All other
+# app code is baked into the images.
+#
+# All commands accept --run-id <id> and --port <port> because scripts/rl-env
+# invokes them that way. RUN_ID scopes the compose project (containers and
+# volumes) only; IMAGE_TAG scopes the images.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.tester-env.yml"
+CONFIG_FILE="$SCRIPT_DIR/tester-env.config.yml"
+SEED_SQL="$SCRIPT_DIR/seed/libretime-seed.sql"
+# Pinned upstream media fixture (40.81 s, 128 kbps, 44.1 kHz). Seeded track
+# files are N copies of it; see seed/libretime-seed.sql.
+MEDIA_FIXTURE="/src/libretime_api/_fixtures/song.mp3"
+MEDIA_COPY_BYTES=654105
+DB_USER=libretime
+DB_NAME=libretime
+
+# IMAGE_TAG is set by scripts/rl-env to a content-addressed tag so identical
+# (baseline, patch-set) combos share an image. Manual invocations get :dev.
+# The three build targets get -api / -legacy / -nginx tags.
+IMAGE_TAG="${IMAGE_TAG:-tester-env-libretime:dev}"
+RUN_ID="${RUN_ID:-}"
+PORT="${PORT:-18650}"
+
+# Browser-visible origin contract: public_url is absolute-URL config used by
+# both the API and the legacy PHP app, so it must be the origin the runner's
+# browser actually uses (bridge gateway when scripts/rl-env sets it).
+APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+LOCAL_URL="http://127.0.0.1:${PORT}"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf '==> ERROR: %s\n' "$*" >&2; exit 1; }
+
+refresh_names() {
+  local suffix=""
+  [ -n "$RUN_ID" ] && suffix="-$RUN_ID"
+  PROJECT_NAME="tester-env-libretime${suffix}"
+  APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+  LOCAL_URL="http://127.0.0.1:${PORT}"
+}
+
+compose() {
+  IMAGE_TAG="$IMAGE_TAG" \
+  PORT="$PORT" \
+  LIBRETIME_CONFIG_FILEPATH="$CONFIG_FILE" \
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" --project-directory "$SCRIPT_DIR" "$@"
+}
+
+write_config() {
+  # public_url cannot be overridden by env for the PHP legacy app, so the
+  # pinned config is regenerated with the current origin on every start.
+  cat >"$CONFIG_FILE" <<EOF
+general:
+  public_url: ${APP_URL}
+  api_key: tester-env-libretime-api-key
+  secret_key: tester-env-libretime-secret-key
+  timezone: UTC
+storage:
+  path: /srv/libretime
+database:
+  host: postgres
+  port: 5432
+  name: libretime
+  user: libretime
+  password: libretime
+rabbitmq:
+  host: rabbitmq
+  port: 5672
+  vhost: /libretime
+  user: libretime
+  password: libretime
+EOF
+}
+
+http_status() {
+  local path="$1" out
+  out=$(curl -sS -o /dev/null -w '%{http_code}' "${LOCAL_URL}${path}" 2>/dev/null) || true
+  printf '%s' "${out:-000}"
+}
+
+wait_for_postgres() {
+  local deadline=$((SECONDS + 120))
+  log "waiting for postgres"
+  while [ $SECONDS -lt $deadline ]; do
+    if compose exec -T postgres pg_isready -U libretime -d libretime >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  die "postgres did not become ready within 120s"
+}
+
+migrate() {
+  log "applying migrations (seeds admin/admin on an empty database)"
+  compose run --rm api libretime-api migrate || die "libretime-api migrate failed"
+}
+
+wait_for_http() {
+  local path="$1" label="$2" deadline=$((SECONDS + 300)) code
+  log "waiting for ${label} at ${LOCAL_URL}${path}"
+  while [ $SECONDS -lt $deadline ]; do
+    code=$(http_status "$path")
+    if [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 400 ]; then
+      log "${label}: HTTP ${code}"
+      return 0
+    fi
+    sleep 2
+  done
+  compose logs --tail 80 api legacy nginx 2>&1 || true
+  die "${label} did not respond within 300s"
+}
+
+cmd_deploy() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  write_config
+  log "images ${IMAGE_TAG}-{api,legacy,nginx}, project ${PROJECT_NAME}, port ${PORT}"
+  log "browser origin ${APP_URL}"
+  compose up -d --build --remove-orphans
+  wait_for_postgres
+  migrate
+  wait_for_http /api/v2/version "api"
+  wait_for_http / "legacy login page"
+  log "LibreTime is up: ${APP_URL} (local ${LOCAL_URL})"
+  log "login: admin / admin"
+}
+
+cmd_start() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  write_config
+  compose up -d --remove-orphans
+  wait_for_postgres
+  wait_for_http /api/v2/version "api"
+  wait_for_http / "legacy login page"
+  log "LibreTime is up: ${APP_URL} (local ${LOCAL_URL})"
+  log "login: admin / admin"
+}
+
+cmd_stop() {
+  log "stopping ${PROJECT_NAME} (data volumes preserved)"
+  compose stop >/dev/null
+  log "stopped"
+}
+
+cmd_reset() {
+  log "removing ${PROJECT_NAME} containers and volumes (postgres_data, rabbitmq_data, libretime_storage)"
+  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  log "reset complete (images preserved)"
+}
+
+cmd_status() {
+  log "project: ${PROJECT_NAME}"
+  compose ps 2>/dev/null || log "no compose state"
+  log "api: HTTP $(http_status /api/v2/version)"
+  log "legacy: HTTP $(http_status /)"
+  # Report the origin the running stack was deployed with; the caller's env may
+  # not match it.
+  local deployed_url=""
+  [ -f "$CONFIG_FILE" ] && deployed_url=$(sed -n 's/^  public_url: //p' "$CONFIG_FILE")
+  log "url: ${LOCAL_URL} (public_url ${deployed_url:-${APP_URL}})"
+  log "login: admin / admin"
+  log "images: ${IMAGE_TAG}-{api,legacy,nginx}"
+}
+
+cmd_logs() {
+  local service="${1:-}"
+  if [ -n "$service" ]; then
+    compose logs -f --tail=200 "$service"
+  else
+    compose logs -f --tail=100
+  fi
+}
+
+psql_at() {
+  compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atc "$1"
+}
+
+require_running() {
+  local code
+  code=$(http_status /api/v2/version)
+  [ "$code" = 200 ] || die "the stack is not up (api HTTP ${code}); run ./tester-env deploy or start first"
+}
+
+cmd_seed() {
+  require_running
+  [ -f "$SEED_SQL" ] || die "missing $SEED_SQL"
+
+  log "loading deterministic seed data (Riverbend Community Radio theme)"
+  compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -f - \
+    <"$SEED_SQL" >/dev/null || die "seed SQL failed"
+
+  log "writing seeded media files to the libretime_storage volume"
+  compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -At -F'|' \
+      -c "SELECT filepath, filesize / ${MEDIA_COPY_BYTES} FROM cc_files WHERE filepath LIKE 'seed/%' ORDER BY id" \
+    | compose exec -T api sh -c '
+        set -e
+        mkdir -p /srv/libretime/seed
+        while IFS="|" read -r path copies; do
+          [ -n "$path" ] || continue
+          : > "/srv/libretime/$path"
+          i=0
+          while [ "$i" -lt "$copies" ]; do
+            cat "'"$MEDIA_FIXTURE"'" >> "/srv/libretime/$path"
+            i=$((i + 1))
+          done
+        done' || die "media file generation failed"
+
+  log "seed applied: $(psql_at 'SELECT count(*) FROM cc_files') tracks, \
+$(psql_at 'SELECT count(*) FROM cc_playlist') playlists, \
+$(psql_at 'SELECT count(*) FROM cc_block') blocks, \
+$(psql_at 'SELECT count(*) FROM cc_show') shows \
+($(psql_at 'SELECT count(*) FROM cc_show_instances') instances), \
+$(psql_at 'SELECT count(*) FROM cc_webstream') webstreams, \
+users admin (A), dana (P), miles (H)"
+}
+
+# POST /library/contents-feed the way legacy/public/js/airtime/library/library.js
+# does: the track/playlist/block/webstream table is server-side and needs the
+# full datatables column map plus the XHR header for the JSON context.
+library_columns() {
+  printf '%s' "id track_title artist_name album_title genre length year utime mtime ftype \
+track_number mood bpm composer info_url bit_rate sample_rate isrc_number encoded_by label \
+copyright mime language filepath owner_id conductor replay_gain lptime is_playlist \
+is_scheduled cuein cueout description artwork track_type_id"
+}
+
+library_feed() {
+  local jar="$2" args="format=json&type=${1}&advSearch=true&sEcho=1&iDisplayStart=0&iDisplayLength=100&sSearch=&iSortingCols=1&iSortCol_0=1&sSortDir_0=asc" n=0 c
+  for c in $(library_columns); do
+    args="$args&mDataProp_$n=$c&bSearchable_$n=true&bSortable_$n=true"
+    n=$((n + 1))
+  done
+  args="$args&iColumns=$n"
+  curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' -X POST \
+    "$LOCAL_URL/library/contents-feed" -d "$args"
+}
+
+# Logs in as admin/admin and prints the cookie jar path.
+login_jar() {
+  local jar csrf code
+  jar=$(mktemp)
+  csrf=$(curl -sS -c "$jar" "$LOCAL_URL/login" \
+    | sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$csrf" ] || { rm -f "$jar"; return 1; }
+  code=$(curl -sS -b "$jar" -c "$jar" -o /dev/null -w '%{http_code}' -X POST "$LOCAL_URL/login" \
+    --data-urlencode username=admin --data-urlencode password=admin \
+    --data-urlencode "csrf=$csrf")
+  [ "$code" = 302 ] || { rm -f "$jar"; return 1; }
+  printf '%s' "$jar"
+}
+
+verify_ok=0
+verify_failed=0
+ok() { printf '  ok   %s\n' "$*"; verify_ok=$((verify_ok + 1)); }
+bad() { printf '  FAIL %s\n' "$*" >&2; verify_failed=$((verify_failed + 1)); }
+
+expect_eq() {
+  local label="$1" want="$2" got="$3"
+  if [ "$got" = "$want" ]; then ok "$label"; else bad "$label (expected '$want', got '$got')"; fi
+}
+
+expect_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  case "$haystack" in
+    *"$needle"*) ok "$label" ;;
+    *) bad "$label (missing '$needle')" ;;
+  esac
+}
+
+cmd_verify() {
+  require_running
+  local jar body
+
+  log "database: seeded entities and relationships"
+  expect_eq "27 tracks in cc_files" 27 "$(psql_at 'SELECT count(*) FROM cc_files')"
+  expect_eq "4 playlists" 4 "$(psql_at 'SELECT count(*) FROM cc_playlist')"
+  expect_eq "2 blocks (1 dynamic, 1 static)" 2 "$(psql_at 'SELECT count(*) FROM cc_block')"
+  expect_eq "2 webstreams" 2 "$(psql_at 'SELECT count(*) FROM cc_webstream')"
+  expect_eq "3 shows" 3 "$(psql_at 'SELECT count(*) FROM cc_show')"
+  expect_eq "6 show instances (current and next week)" 6 "$(psql_at 'SELECT count(*) FROM cc_show_instances')"
+  expect_eq "30 scheduled items across the instances" 30 "$(psql_at 'SELECT count(*) FROM cc_schedule')"
+  expect_eq "3 users (admin, dana, miles)" 3 "$(psql_at 'SELECT count(*) FROM cc_subjs')"
+  expect_eq "Morning Drive length 21:46" '00:21:46' "$(psql_at "SELECT length FROM cc_playlist WHERE id = 1")"
+  expect_eq "Late Night Jazz length 20:24" '00:20:24' "$(psql_at "SELECT length FROM cc_playlist WHERE id = 2")"
+  expect_eq "Weekend Folk Hour length 15:38" '00:15:38' "$(psql_at "SELECT length FROM cc_playlist WHERE id = 3")"
+  expect_eq "Station IDs and Beds length 2:03" '00:02:03' "$(psql_at "SELECT length FROM cc_playlist WHERE id = 4")"
+  expect_eq "Jazz Rotation is dynamic, 30 minute limit" 'dynamic|00:30:00' \
+    "$(psql_at "SELECT type || '|' || length FROM cc_block WHERE id = 1")"
+  expect_eq "Jazz Rotation criteria match the genre catalogue" 'genre|contains|Jazz' \
+    "$(psql_at "SELECT criteria || '|' || modifier || '|' || value FROM cc_blockcriteria WHERE block_id = 1 AND criteria = 'genre'")"
+  expect_eq "Top of Hour Beds static length 1:22" 'static|00:01:22' \
+    "$(psql_at "SELECT type || '|' || length FROM cc_block WHERE id = 2")"
+  expect_eq "show 1 linked to the Morning Drive autoplaylist" 't|1' \
+    "$(psql_at 'SELECT linked, autoplaylist_id FROM cc_show WHERE id = 1')"
+
+  log "media: seeded files exist in the storage volume"
+  expect_eq "27 media files on disk" 27 "$(compose exec -T api sh -c 'ls /srv/libretime/seed | wc -l' | tr -d ' ')"
+  expect_eq "media byte total matches cc_files.filesize" \
+    "$(psql_at 'SELECT sum(filesize) FROM cc_files')" \
+    "$(compose exec -T api sh -c 'cat /srv/libretime/seed/*.mp3 | wc -c' | tr -d ' ')"
+
+  log "http: legacy UI endpoints a browser agent uses"
+  if jar=$(login_jar); then
+    ok "admin/admin login redirects to /showbuilder"
+  else
+    bad "admin/admin login failed"
+    jar=""
+  fi
+
+  if [ -n "$jar" ]; then
+    body=$(library_feed 1 "$jar")
+    expect_contains "library Tracks tab count is 27" '"iTotalRecords":27' "$body"
+    expect_contains "library Tracks tab lists Blue Hour Waltz" 'Blue Hour Waltz' "$body"
+    expect_contains "library Tracks tab lists the station ID" 'Riverbend Station ID - Morning' "$body"
+    body=$(library_feed 2 "$jar")
+    expect_contains "library Playlists tab count is 4" '"iTotalRecords":4' "$body"
+    expect_contains "library Playlists tab lists Morning Drive" 'Morning Drive' "$body"
+    body=$(library_feed 3 "$jar")
+    expect_contains "library Smart Blocks tab count is 2" '"iTotalRecords":2' "$body"
+    expect_contains "library Smart Blocks tab lists Jazz Rotation" 'Jazz Rotation' "$body"
+    body=$(library_feed 4 "$jar")
+    expect_contains "library Webstreams tab count is 2" '"iTotalRecords":2' "$body"
+    expect_contains "library Webstreams tab lists Riverbend Live Studio Feed" 'Riverbend Live Studio Feed' "$body"
+
+    body=$(curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' \
+      "$LOCAL_URL/playlist/edit?id=1&type=playlist&format=json")
+    expect_contains "playlist 1 renders its 6 tracks" '"length":"21:46' "$body"
+    expect_contains "playlist 1 contains Northbound" 'Northbound' "$body"
+    expect_contains "playlist 1 contains Green Room Blues" 'Green Room Blues' "$body"
+
+    body=$(curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' \
+      "$LOCAL_URL/playlist/edit?id=1&type=block&format=json")
+    expect_contains "smart block 1 renders a 30 minute dynamic block" '"length":"~30:00' "$body"
+    expect_contains "smart block 1 renders its Genre criteria" 'Jazz' "$body"
+
+    body=$(curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' -X POST \
+      "$LOCAL_URL/user/get-user-data-table-info/format/json" \
+      -d 'iDisplayStart=0&iDisplayLength=25&sEcho=1&sSearch=&iSortingCols=1&iSortCol_0=1&sSortDir_0=asc&iColumns=6&mDataProp_0=id&mDataProp_1=login&mDataProp_2=first_name&mDataProp_3=last_name&mDataProp_4=type&mDataProp_5=delete&bSearchable_0=false&bSearchable_1=true&bSearchable_2=true&bSearchable_3=true&bSearchable_4=false&bSearchable_5=false&bSortable_0=true&bSortable_1=true&bSortable_2=true&bSortable_3=true&bSortable_4=true&bSortable_5=false')
+    expect_contains "Settings users table count is 3" '"iTotalRecords":3' "$body"
+    expect_contains "Settings users table lists dana as Program Manager" '"login":"dana"' "$body"
+    expect_contains "Settings users table lists miles as DJ" '"login":"miles"' "$body"
+
+    body=$(curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' \
+      "$LOCAL_URL/schedule/event-feed?format=json&start=$(date -u +%Y-%m-%d)&end=$(date -u -d '+9 days' +%Y-%m-%d)")
+    expect_contains "Radio Calendar shows Sunrise Broadcast" 'Sunrise Broadcast' "$body"
+    expect_contains "Radio Calendar shows After Hours Jazz" 'After Hours Jazz' "$body"
+    expect_contains "Radio Calendar shows Saturday Folk Session" 'Saturday Folk Session' "$body"
+
+    body=$(curl -sS -b "$jar" -H 'X-Requested-With: XMLHttpRequest' \
+      "$LOCAL_URL/showbuilder/builder-feed?format=json&start=$(date -u +%Y-%m-%dT%H:%M)&end=$(date -u -d '+3 days' +%Y-%m-%dT%H:%M)&timezone=UTC")
+    expect_contains "Showbuilder lists scheduled show content" 'Midnight Ledger' "$body"
+
+    rm -f "$jar"
+  fi
+
+  if [ "$verify_failed" -ne 0 ]; then
+    die "verify failed: ${verify_failed} check(s) failed, ${verify_ok} passed"
+  fi
+  log "verify passed: ${verify_ok} checks"
+}
+
+usage() {
+  cat <<EOF
+Usage: ./tester-env <command> [--run-id ID] [--port PORT]
+
+Commands:
+  deploy   Build the api/legacy/nginx images from this checkout, start
+           postgres+rabbitmq+api+legacy+nginx, run 'libretime-api migrate'
+           (seeds admin/admin), and wait for the API and login page.
+  start    Start the existing stack without rebuilding (writes config, migrate
+           is not re-run; use deploy on a fresh volume).
+  seed     Load the deterministic Riverbend Community Radio seed: 27 tracks
+           with real files, 4 playlists, 2 blocks, 3 weekly shows with
+           instances/content, 2 webstreams and the dana/miles users.
+  verify   Check the seeded rows, media files and the legacy UI endpoints
+           (library tabs, playlist/block detail, users, calendar, showbuilder).
+  stop     Stop the services, preserving data volumes.
+  reset    Remove containers and the postgres_data, rabbitmq_data and
+           libretime_storage volumes (images preserved).
+  status   Show compose state, HTTP status, URL and credentials.
+  logs     Follow logs; pass a service (postgres|rabbitmq|api|legacy|nginx).
+  help     This message.
+
+Deterministic path: ./tester-env reset && ./tester-env deploy && ./tester-env seed
+(seed is also re-runnable on its own: it clears the seeded tables first).
+
+Environment:
+  IMAGE_TAG                  Image tag base (default tester-env-libretime:dev;
+                             scripts/rl-env sets a content-addressed tag)
+  RUN_ID                     Scopes the compose project/containers/volumes
+  PORT                       Host port for nginx (default 18650)
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible origin written to public_url
+                             (default http://localhost:PORT)
+
+Bind-mounted mutation subtrees: legacy/public/js (nginx) and
+legacy/application (php-fpm).
+EOF
+}
+
+main() {
+  local command="" positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) RUN_ID="${2:-}"; shift 2 ;;
+      --run-id=*) RUN_ID="${1#*=}"; shift ;;
+      --port) PORT="${2:-}"; shift 2 ;;
+      --port=*) PORT="${1#*=}"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  command="${positional[0]:-help}"
+  set -- "${positional[@]:1}"
+
+  refresh_names
+
+  case "$command" in
+    deploy) cmd_deploy ;;
+    start) cmd_start ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    stop) cmd_stop ;;
+    reset) cmd_reset ;;
+    status) cmd_status ;;
+    logs) cmd_logs "${1:-}" ;;
+    help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
